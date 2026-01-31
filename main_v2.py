@@ -74,42 +74,48 @@ class MPVRPSolver:
     def __init__(self, instance):
         self.inst = instance
         self.solver = pywraplp.Solver.CreateSolver('SCIP')
-        if not self.solver: self.solver = pywraplp.Solver.CreateSolver('CBC')
+        if not self.solver: 
+            self.solver = pywraplp.Solver.CreateSolver('CBC')
 
-        # Augmentation pour gérer les instances complexes
         self.MAX_MINI_ROUTES = 10
-        self.solver.set_time_limit(300000) # 2 minutes max
+        self.solver.set_time_limit(120000)
         self.infinity = self.solver.infinity()
 
     def solve(self):
-        print("🛠️ Construction du modèle (Multi-Dépôts)...")
+        print("🛠️ Construction du modèle (COMPLET ET CORRIGÉ)...")
 
-        x = {} # Routage
-        y = {} # Produit
-        q = {} # Livraison Station
-        load = {} # Chargement au Dépôt (NOUVEAU)
-        delta = {} # Nettoyage
+        x = {}      # Routage: x[k,r,i,j] = 1 si véhicule k va de i à j sur route r
+        y = {}      # Produit: y[k,r,p] = 1 si véhicule k transporte produit p sur route r
+        q = {}      # Livraison: q[k,r,i,p] = quantité livrée à station i
+        load = {}   # Chargement: load[k,r,d,p] = quantité chargée au dépôt d
+        delta = {}  # Nettoyage: delta[k,r] = 1 si nettoyage requis
 
         all_indices = range(len(self.inst.nodes))
         depot_indices = [i for i, n in enumerate(self.inst.nodes) if n['type'] == 'depot']
+        station_indices = [i for i, n in enumerate(self.inst.nodes) if n['type'] == 'station']
+        garage_indices = [i for i, n in enumerate(self.inst.nodes) if n['type'] == 'garage']
 
+        # ========== VARIABLES ==========
         for k in range(self.inst.nb_vehicles):
             cap = self.inst.vehicles[k]['capacity']
+            
             for r in range(self.MAX_MINI_ROUTES):
                 delta[k, r] = self.solver.BoolVar(f'd_{k}_{r}')
 
                 for p in range(self.inst.nb_products):
                     y[k, r, p] = self.solver.BoolVar(f'y_{k}_{r}_{p}')
 
-                    # Variable de chargement spécifique par dépôt
+                    # Variables de chargement par dépôt
                     for d_idx in depot_indices:
                         load[k, r, d_idx, p] = self.solver.NumVar(0, cap, f'load_{k}_{r}_{d_idx}_{p}')
 
+                # Variables de routage
                 for i in all_indices:
                     for j in all_indices:
                         if i != j:
                             x[k, r, i, j] = self.solver.BoolVar(f'x_{k}_{r}_{i}_{j}')
 
+                    # Variables de livraison
                     if self.inst.nodes[i]['type'] == 'station':
                         for p in range(self.inst.nb_products):
                             if self.inst.nodes[i]['demands'][p] > 0:
@@ -117,225 +123,458 @@ class MPVRPSolver:
 
         print("🔗 Ajout des contraintes...")
 
-        # 1. SATISFACTION DEMANDE
-        for i in all_indices:
+        # ========== CONTRAINTE 1 : SATISFACTION DEMANDE ==========
+        print("   [1/10] Satisfaction demande...")
+        for i in station_indices:
             node = self.inst.nodes[i]
-            if node['type'] == 'station':
-                for p in range(self.inst.nb_products):
-                    if node['demands'][p] > 0:
-                        self.solver.Add(sum(q[k, r, i, p] for k in range(self.inst.nb_vehicles) for r in range(self.MAX_MINI_ROUTES)) == node['demands'][p])
-
-        # 2. GESTION DES DÉPÔTS (STOCK & LIEN)
-        # Pour chaque dépôt réel, on vérifie son stock
-        for d_idx in depot_indices:
-            real_depot_idx = 0
-            # Retrouver l'index dans la liste self.inst.depots
-            for idx, d in enumerate(self.inst.depots):
-                if d['id'] == self.inst.nodes[d_idx]['id']:
-                    real_depot_idx = idx
-                    break
-
             for p in range(self.inst.nb_products):
-                # Contrainte de Stock : Somme des chargements ici <= Stock disponible
+                if node['demands'][p] > 0:
+                    self.solver.Add(
+                        sum(q.get((k, r, i, p), 0) 
+                            for k in range(self.inst.nb_vehicles) 
+                            for r in range(self.MAX_MINI_ROUTES))
+                        == node['demands'][p],
+                        f"demand_station_{i}_prod_{p}"
+                    )
+
+        # ========== CONTRAINTE 2 : STOCK DÉPÔTS ==========
+        print("   [2/10] Stocks dépôts...")
+        for d_idx in depot_indices:
+            # Trouver l'objet dépôt correspondant
+            depot_obj = next(d for d in self.inst.depots 
+                           if d['id'] == self.inst.nodes[d_idx]['id'])
+            
+            for p in range(self.inst.nb_products):
                 self.solver.Add(
-                    sum(load[k, r, d_idx, p] for k in range(self.inst.nb_vehicles) for r in range(self.MAX_MINI_ROUTES))
-                    <= self.inst.depots[real_depot_idx]['stocks'][p]
+                    sum(load.get((k, r, d_idx, p), 0)
+                        for k in range(self.inst.nb_vehicles)
+                        for r in range(self.MAX_MINI_ROUTES))
+                    <= depot_obj['stocks'][p],
+                    f"stock_depot_{d_idx}_prod_{p}"
                 )
 
-        # 3. ÉQUILIBRE CHARGEMENT / LIVRAISON
+        # ========== CONTRAINTE 3 : CAPACITÉ VÉHICULE PAR MINI-ROUTE ==========
+        print("   [3/10] Capacité véhicules...")
+        for k in range(self.inst.nb_vehicles):
+            cap = self.inst.vehicles[k]['capacity']
+            
+            for r in range(self.MAX_MINI_ROUTES):
+                # ✅ CRITIQUE : Total chargé sur UNE mini-route <= capacité
+                total_loaded_on_route = sum(
+                    load.get((k, r, d_idx, p), 0)
+                    for d_idx in depot_indices
+                    for p in range(self.inst.nb_products)
+                )
+                self.solver.Add(
+                    total_loaded_on_route <= cap,
+                    f"capacity_vehicle_{k}_route_{r}"
+                )
+
+        # ========== CONTRAINTE 4 : MONO-PRODUIT PAR MINI-ROUTE ==========
+        print("   [4/10] Mono-produit...")
         for k in range(self.inst.nb_vehicles):
             for r in range(self.MAX_MINI_ROUTES):
-                for p in range(self.inst.nb_products):
-                    total_delivered = sum(q[k,r,i,p] for i in all_indices if (k,r,i,p) in q)
-                    total_loaded = sum(load[k,r,d,p] for d in depot_indices)
+                # Un seul produit par mini-route
+                self.solver.Add(
+                    sum(y[k, r, p] for p in range(self.inst.nb_products)) <= 1,
+                    f"mono_product_v{k}_r{r}"
+                )
 
-                    # Ce qu'on livre = Ce qu'on a chargé (conservation masse)
-                    self.solver.Add(total_delivered == total_loaded)
-
-                    # On ne peut charger au dépôt D que si on sort du dépôt D
-                    # load <= Capacité * Somme(x[d->j])
-                    for d_idx in depot_indices:
-                        outgoing_traffic = sum(x[k,r,d_idx,j] for j in all_indices if d_idx!=j)
-                        self.solver.Add(load[k,r,d_idx,p] <= self.inst.vehicles[k]['capacity'] * outgoing_traffic)
-
-        # 4. CAPACITÉ & MONO-PRODUIT
+        # ========== CONTRAINTE 5 : CONSERVATION MASSE PAR MINI-ROUTE ==========
+        print("   [5/11] Conservation masse...")
         for k in range(self.inst.nb_vehicles):
+            cap = self.inst.vehicles[k]['capacity']
+            
             for r in range(self.MAX_MINI_ROUTES):
-                cap = self.inst.vehicles[k]['capacity']
-                self.solver.Add(sum(y[k, r, p] for p in range(self.inst.nb_products)) <= 1)
-
                 for p in range(self.inst.nb_products):
-                    # q <= Cap * y
-                    total_delivered = sum(q[k,r,i,p] for i in all_indices if (k,r,i,p) in q)
-                    self.solver.Add(total_delivered <= cap * y[k, r, p])
+                    total_loaded = sum(
+                        load.get((k, r, d_idx, p), 0) 
+                        for d_idx in depot_indices
+                    )
+                    
+                    total_delivered = sum(
+                        q.get((k, r, i, p), 0)
+                        for i in station_indices
+                    )
+                    
+                    self.solver.Add(
+                        total_loaded == total_delivered,
+                        f"mass_conservation_v{k}_r{r}_p{p}"
+                    )
+                    
+                    self.solver.Add(
+                        total_delivered <= cap * y[k, r, p],
+                        f"delivery_requires_product_v{k}_r{r}_p{p}"
+                    )
+                    
+                    self.solver.Add(
+                        total_loaded <= cap * y[k, r, p],
+                        f"loading_requires_product_v{k}_r{r}_p{p}"
+                    )
 
-                    # Visite obligatoire si livraison
-                    for i in all_indices:
-                        if (k,r,i,p) in q:
-                            incoming = sum(x[k, r, j, i] for j in all_indices if i!=j)
-                            self.solver.Add(q[k, r, i, p] <= cap * incoming)
+        # ========== ✅ NOUVELLE CONTRAINTE 5bis : UN SEUL DÉPÔT PAR MINI-ROUTE ==========
+        print("   [5bis/11] Un seul dépôt par mini-route...")
+        for k in range(self.inst.nb_vehicles):
+            cap = self.inst.vehicles[k]['capacity']
+            
+            for r in range(self.MAX_MINI_ROUTES):
+                # Nombre de dépôts visités sur cette mini-route
+                depot_visits = []
+                for d_idx in depot_indices:
+                    # Variable binaire : ce dépôt est-il visité ?
+                    depot_visited = self.solver.BoolVar(f'depot_visit_{k}_{r}_{d_idx}')
+                    depot_visits.append(depot_visited)
+                    
+                    # Lien avec le flux sortant du dépôt
+                    outgoing = sum(
+                        x.get((k, r, d_idx, j), 0)
+                        for j in all_indices if j != d_idx
+                    )
+                    
+                    # Si on sort du dépôt, alors depot_visited = 1
+                    self.solver.Add(depot_visited >= outgoing)
+                    self.solver.Add(depot_visited <= outgoing * len(all_indices))
+                    
+                    # Si on ne visite pas le dépôt, on ne peut rien y charger
+                    for p in range(self.inst.nb_products):
+                        self.solver.Add(
+                            load.get((k, r, d_idx, p), 0) <= cap * depot_visited,
+                            f"load_requires_depot_visit_v{k}_r{r}_d{d_idx}_p{p}"
+                        )
+                
+                # ✅ CONTRAINTE CLÉE : Maximum 1 dépôt par mini-route
+                self.solver.Add(
+                    sum(depot_visits) <= 1,
+                    f"max_one_depot_v{k}_r{r}"
+                )
 
-        # 5. FLUX
+        # ========== CONTRAINTE 6 : LIEN CHARGEMENT <-> VISITE DÉPÔT ==========
+        print("   [6/10] Lien chargement-visite dépôt...")
+        for k in range(self.inst.nb_vehicles):
+            cap = self.inst.vehicles[k]['capacity']
+            
+            for r in range(self.MAX_MINI_ROUTES):
+                for d_idx in depot_indices:
+                    # Flux sortant du dépôt
+                    outgoing = sum(
+                        x.get((k, r, d_idx, j), 0)
+                        for j in all_indices if j != d_idx
+                    )
+                    
+                    for p in range(self.inst.nb_products):
+                        # ✅ On ne peut charger que si on visite le dépôt
+                        self.solver.Add(
+                            load.get((k, r, d_idx, p), 0) <= cap * outgoing,
+                            f"load_requires_visit_v{k}_r{r}_d{d_idx}_p{p}"
+                        )
+
+        # ========== CONTRAINTE 7 : LIEN LIVRAISON <-> VISITE STATION ==========
+        print("   [7/10] Lien livraison-visite station...")
+        for k in range(self.inst.nb_vehicles):
+            cap = self.inst.vehicles[k]['capacity']
+            
+            for r in range(self.MAX_MINI_ROUTES):
+                for i in station_indices:
+                    # Flux entrant à la station
+                    incoming = sum(
+                        x.get((k, r, j, i), 0)
+                        for j in all_indices if j != i
+                    )
+                    
+                    for p in range(self.inst.nb_products):
+                        if (k, r, i, p) in q:
+                            # ✅ On ne peut livrer que si on visite la station
+                            self.solver.Add(
+                                q[k, r, i, p] <= cap * incoming,
+                                f"delivery_requires_visit_v{k}_r{r}_s{i}_p{p}"
+                            )
+
+        # ========== CONTRAINTE 8 : CONSERVATION FLUX ==========
+        print("   [8/10] Conservation flux...")
         for k in range(self.inst.nb_vehicles):
             for r in range(self.MAX_MINI_ROUTES):
                 for i in all_indices:
-                    if self.inst.nodes[i]['type'] == 'garage': continue
-                    sum_in = sum(x[k, r, j, i] for j in all_indices if i != j)
-                    sum_out = sum(x[k, r, i, j] for j in all_indices if i != j)
-                    self.solver.Add(sum_in == sum_out)
+                    # Flux entrant
+                    flow_in = sum(
+                        x.get((k, r, j, i), 0)
+                        for j in all_indices if j != i
+                    )
+                    
+                    # Flux sortant
+                    flow_out = sum(
+                        x.get((k, r, i, j), 0)
+                        for j in all_indices if j != i
+                    )
+                    
+                    # ✅ Ce qui entre = ce qui sort (sauf garages)
+                    if self.inst.nodes[i]['type'] != 'garage':
+                        self.solver.Add(
+                            flow_in == flow_out,
+                            f"flow_conservation_v{k}_r{r}_node{i}"
+                        )
 
-        # 6. NETTOYAGE
+        # ========== CONTRAINTE 9 : DÉPART/RETOUR GARAGE ==========
+        print("   [9/10] Garage départ/retour...")
+        for k in range(self.inst.nb_vehicles):
+            garage_id = self.inst.vehicles[k]['garage_id']
+            garage_idx = next(i for i, n in enumerate(self.inst.nodes) 
+                             if n['type'] == 'garage' and n['id'] == garage_id)
+            
+            for r in range(self.MAX_MINI_ROUTES):
+                # ✅ Si la route est utilisée, elle part et revient au garage
+                route_used = sum(
+                    x.get((k, r, i, j), 0)
+                    for i in all_indices
+                    for j in all_indices if i != j
+                )
+                
+                # Départ du garage
+                leaving_garage = sum(
+                    x.get((k, r, garage_idx, j), 0)
+                    for j in all_indices if j != garage_idx
+                )
+                
+                # Retour au garage
+                returning_garage = sum(
+                    x.get((k, r, j, garage_idx), 0)
+                    for j in all_indices if j != garage_idx
+                )
+                
+                # Si route utilisée => 1 départ et 1 retour
+                self.solver.Add(leaving_garage <= 1)
+                self.solver.Add(returning_garage <= 1)
+                
+                # Symétrie : si on part, on revient
+                self.solver.Add(leaving_garage == returning_garage)
+
+        # ========== CONTRAINTE 10 : NETTOYAGE ==========
+        print("   [10/10] Gestion nettoyage...")
         for k in range(self.inst.nb_vehicles):
             p_start = self.inst.vehicles[k]['start_product']
+            
+            # Première route : nettoyage si produit différent
             for p in range(self.inst.nb_products):
-                if p != p_start: self.solver.Add(delta[k, 0] >= y[k, 0, p])
+                if p != p_start:
+                    self.solver.Add(delta[k, 0] >= y[k, 0, p])
+            
+            # Routes suivantes : nettoyage si changement
             for r in range(1, self.MAX_MINI_ROUTES):
                 for p1 in range(self.inst.nb_products):
                     for p2 in range(self.inst.nb_products):
-                        if p1 != p2: self.solver.Add(delta[k, r] >= y[k, r-1, p1] + y[k, r, p2] - 1)
+                        if p1 != p2:
+                            self.solver.Add(
+                                delta[k, r] >= y[k, r-1, p1] + y[k, r, p2] - 1
+                            )
 
-        # OBJECTIF
-        dist_obj = sum(self.inst.dist_matrix[i,j] * x[k,r,i,j] for k in range(self.inst.nb_vehicles) for r in range(self.MAX_MINI_ROUTES) for i in all_indices for j in all_indices if i!=j)
-        clean_obj = sum(10.0 * delta[k,r] for k in range(self.inst.nb_vehicles) for r in range(self.MAX_MINI_ROUTES)) # Poids arbitraire
+        # ========== FONCTION OBJECTIF ==========
+        print("🎯 Définition objectif...")
+        
+        dist_obj = sum(
+            self.inst.dist_matrix[i, j] * x.get((k, r, i, j), 0)
+            for k in range(self.inst.nb_vehicles)
+            for r in range(self.MAX_MINI_ROUTES)
+            for i in all_indices
+            for j in all_indices if i != j
+        )
+        
+        clean_obj = sum(
+            10.0 * delta[k, r]
+            for k in range(self.inst.nb_vehicles)
+            for r in range(self.MAX_MINI_ROUTES)
+        )
 
         self.solver.Minimize(dist_obj + clean_obj)
 
+        # ========== RÉSOLUTION ==========
         print("⏳ Résolution en cours...")
         status = self.solver.Solve()
 
-        if status in [pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE]:
-            print(f"✅ Solution trouvée !")
-            return self._extract_solution(x, y, q, load) # On passe 'load' en plus
+        if status == pywraplp.Solver.OPTIMAL:
+            print(f"✅ Solution OPTIMALE trouvée !")
+            print(f"   Objectif: {self.solver.Objective().Value():.2f}")
+            print(f"   Temps: {self.solver.WallTime():.2f}s")
+            return self._extract_solution(x, y, q, load)
+            
+        elif status == pywraplp.Solver.FEASIBLE:
+            print(f"⚠️  Solution FAISABLE trouvée")
+            print(f"   Objectif: {self.solver.Objective().Value():.2f}")
+            return self._extract_solution(x, y, q, load)
+            
         else:
-            print("❌ Infeasible.")
+            print("❌ Pas de solution (Infeasible/Unbounded)")
             return None
+
 
     def _extract_solution(self, x, y, q, load):
-        output_lines = []
-        grand_total_dist = 0.0
-        grand_total_cost = 0.0
-        grand_total_changes = 0
-        nb_vehicles_used = 0
+      output_lines = []
+      grand_total_dist = 0.0
+      grand_total_cost = 0.0
+      grand_total_changes = 0
+      nb_vehicles_used = 0
 
-        # Helpers
-        def get_specific_node(nid, ntype):
-            lst = self.inst.garages if ntype=='G' else (self.inst.depots if ntype=='D' else self.inst.stations)
-            for n in lst:
-                if n['id'] == nid: return n
-            return None
-        def calc_dist(n1, n2): return math.sqrt((n1['x'] - n2['x'])**2 + (n1['y'] - n2['y'])**2)
-        def get_q(k, r, i, p): return q[k, r, i, p].solution_value() if (k,r,i,p) in q else 0.0
-        def get_load(k, r, d, p): return load[k, r, d, p].solution_value() if (k,r,d,p) in load else 0.0
+      def get_node_by_id(node_id, node_type):
+          if node_type == 'G':
+              nodes = self.inst.garages
+          elif node_type == 'D':
+              nodes = self.inst.depots
+          else:
+              nodes = self.inst.stations
+          for n in nodes:
+              if n['id'] == node_id:
+                  return n
+          return None
+      
+      def calc_dist(n1, n2):
+          return math.sqrt((n1['x'] - n2['x'])**2 + (n1['y'] - n2['y'])**2)
+      
+      def get_value(var):
+          return var.solution_value() if var else 0.0
 
-        depot_indices = [i for i, n in enumerate(self.inst.nodes) if n['type'] == 'depot']
+      depot_indices = [i for i, n in enumerate(self.inst.nodes) if n['type'] == 'depot']
+      station_indices = [i for i, n in enumerate(self.inst.nodes) if n['type'] == 'station']
 
-        for k in range(self.inst.nb_vehicles):
-            vehicle = self.inst.vehicles[k]
-            garage_node = get_specific_node(vehicle['garage_id'], 'G')
+      for k in range(self.inst.nb_vehicles):
+          vehicle = self.inst.vehicles[k]
+          garage_node = get_node_by_id(vehicle['garage_id'], 'G')
+          
+          mini_routes = []
+          
+          for r in range(self.MAX_MINI_ROUTES):
+              active_product = -1
+              for p in range(self.inst.nb_products):
+                  if get_value(y[k, r, p]) > 0.5:
+                      active_product = p
+                      break
+              
+              if active_product == -1:
+                  continue
+              
+              depot_used = None
+              depot_qty = 0
+              for d_idx in depot_indices:
+                  qty = get_value(load.get((k, r, d_idx, active_product), None))
+                  if qty > 0.1:
+                      depot_used = self.inst.nodes[d_idx]
+                      depot_qty = qty
+                      break
+              
+              stations_visited = []
+              for s_idx in station_indices:
+                  qty = get_value(q.get((k, r, s_idx, active_product), None))
+                  if qty > 0.1:
+                      stations_visited.append({
+                          'node': self.inst.nodes[s_idx],
+                          'qty': qty
+                      })
+              
+              if depot_used or stations_visited:
+                  mini_routes.append({
+                      'product': active_product,
+                      'depot': depot_used,
+                      'depot_qty': depot_qty,
+                      'stations': stations_visited
+                  })
+          
+          # ✅ SAUT SI VÉHICULE NON UTILISÉ
+          if len(mini_routes) == 0:
+              continue  # ← NE PAS afficher ce véhicule
+          
+          nb_vehicles_used += 1
+          
+          # GÉNÉRATION LIGNES
+          line1_parts = [f"{vehicle['garage_id']}"]
+          line2_parts = [f"{vehicle['start_product']}(0.0)"]
+          
+          current_product = vehicle['start_product']
+          previous_node = garage_node
+          
+          for mini_route in mini_routes:
+              prod = mini_route['product']
+              
+              transition_cost = 0.0
+              if prod != current_product:
+                  transition_cost = self.inst.transition_matrix[current_product][prod]
+                  grand_total_cost += transition_cost
+                  grand_total_changes += 1
+                  current_product = prod
+              
+              if mini_route['depot']:
+                  depot = mini_route['depot']
+                  qty_int = int(round(mini_route['depot_qty']))
+                  
+                  line1_parts.append(f"{depot['id']} [{qty_int}]")
+                  line2_parts.append(f"{prod}({transition_cost:.1f})")
+                  
+                  grand_total_dist += calc_dist(previous_node, depot)
+                  previous_node = depot
+                  transition_cost = 0.0
+              
+              for station_info in mini_route['stations']:
+                  station = station_info['node']
+                  qty_int = int(round(station_info['qty']))
+                  
+                  line1_parts.append(f"{station['id']} ({qty_int})")
+                  line2_parts.append(f"{prod}(0.0)")
+                  
+                  grand_total_dist += calc_dist(previous_node, station)
+                  previous_node = station
+          
+          line1_parts.append(f"{vehicle['garage_id']}")
+          line2_parts.append(f"{current_product}(0.0)")
+          grand_total_dist += calc_dist(previous_node, garage_node)
+          
+          # ✅ AFFICHER SEULEMENT LES VÉHICULES UTILISÉS
+          output_lines.append(f"{vehicle['id']}: " + " - ".join(line1_parts))
+          output_lines.append(f"{vehicle['id']}: " + " - ".join(line2_parts))
+          output_lines.append("")
+      
+      output_lines.append(f"{nb_vehicles_used}")
+      output_lines.append(f"{grand_total_changes}")
+      output_lines.append(f"{grand_total_cost:.2f}")
+      output_lines.append(f"{grand_total_dist:.2f}")
+      output_lines.append("OR-Tools-SCIP")
+      output_lines.append("3.2")
+      
+      return "\n".join(output_lines)
 
-            visited_sequence = []
-            visited_sequence.append({'node': garage_node, 'type': 'G', 'qty': 0, 'prod': vehicle['start_product']})
+import glob
 
-            used_vehicle = False
-            prev_prod = vehicle['start_product']
-
-            for r in range(self.MAX_MINI_ROUTES):
-                active_p = -1
-                for p in range(self.inst.nb_products):
-                    if y[k, r, p].solution_value() > 0.5:
-                        active_p = p
-                        break
-                if active_p == -1: continue
-                used_vehicle = True
-
-                # Identifier quel dépôt a fourni la marchandise
-                used_depot_node = None
-                load_qty = 0
-                for d_idx in depot_indices:
-                    val = get_load(k, r, d_idx, active_p)
-                    if val > 0.1:
-                        load_qty = int(round(val))
-                        used_depot_node = self.inst.nodes[d_idx]
-                        break
-
-                # Si on a chargé (cas normal), on ajoute le dépôt
-                if used_depot_node and load_qty > 0:
-                     visited_sequence.append({'node': used_depot_node, 'type': 'D', 'qty': load_qty, 'prod': active_p})
-
-                # Identifier les stations
-                for i in range(len(self.inst.nodes)):
-                    if self.inst.nodes[i]['type'] == 'station':
-                        qty = get_q(k, r, i, active_p)
-                        if qty > 0.1:
-                            qty_int = int(round(qty))
-                            visited_sequence.append({'node': self.inst.nodes[i], 'type': 'S', 'qty': qty_int, 'prod': active_p})
-
-                prev_prod = active_p
-
-            visited_sequence.append({'node': garage_node, 'type': 'G', 'qty': 0, 'prod': prev_prod})
-
-            # Comptage strict : Un véhicule n'est "utilisé" que s'il a visité autre chose que G->G
-            if len(visited_sequence) > 2:
-                nb_vehicles_used += 1
-            else:
-                # Si le véhicule n'a rien fait, on reset la séquence pour l'affichage propre
-                visited_sequence = [{'node': garage_node, 'type': 'G', 'qty': 0, 'prod': vehicle['start_product']},
-                                    {'node': garage_node, 'type': 'G', 'qty': 0, 'prod': vehicle['start_product']}]
-
-            # Génération Lignes
-            line1_parts, line2_parts = [], []
-            veh_dist, veh_cost = 0.0, 0.0
-
-            line1_parts.append(f"{vehicle['garage_id']}")
-            line2_parts.append(f"{vehicle['start_product']}(0.0)")
-
-            curr_prod = vehicle['start_product']
-
-            for idx in range(1, len(visited_sequence)):
-                curr = visited_sequence[idx]
-                prev = visited_sequence[idx-1]
-
-                veh_dist += calc_dist(prev['node'], curr['node'])
-
-                txt = f"{curr['node']['id']}"
-                if curr['type'] in ['D', 'S']:
-                    braces = "[]" if curr['type'] == 'D' else "()"
-                    txt += f" {braces[0]}{curr['qty']}{braces[1]}"
-                line1_parts.append(txt)
-
-                step_cost = 0.0
-                if curr['prod'] != curr_prod:
-                    step_cost = self.inst.transition_matrix[curr_prod][curr['prod']]
-                    veh_cost += step_cost
-                    grand_total_changes += 1
-                    curr_prod = curr['prod']
-                line2_parts.append(f"{curr['prod']}({step_cost:.1f})")
-
-            grand_total_dist += veh_dist
-            grand_total_cost += veh_cost
-
-            output_lines.append(f"{vehicle['id']}: " + " - ".join(line1_parts))
-            output_lines.append(f"{vehicle['id']}: " + " - ".join(line2_parts))
-            output_lines.append("")
-
-        output_lines.append(f"{nb_vehicles_used}")
-        output_lines.append(f"{grand_total_changes}")
-        output_lines.append(f"{grand_total_cost:.2f}")
-        output_lines.append(f"{grand_total_dist:.2f}")
-        output_lines.append("OR-Tools-SCIP")
-        output_lines.append("2.5")
-
-        return "\n".join(output_lines)
-"""
 if __name__ == "__main__":
-    file_path = "MPVRP_S_002_s10_d2_p3.dat" # Change le nom ici pour chaque instance
-    try:
-        inst = MPVRPInstance(file_path)
-        print(f"Chargement: {file_path}")
-        solver = MPVRPSolver(inst)
-        res = solver.solve()
-        if res:
-            base = os.path.basename(file_path).replace(".txt", "")
-            with open("Sol_" + base, "w") as f: f.write(res)
-            print(f"💾 Sauvegardé: Sol_{base}")
-    except Exception as e: print(e)"""
+    # Récupère tous les fichiers .dat commençant par MPVRP_S_
+    fichiers_a_traiter = sorted(glob.glob("MPVRP_S_*.dat"))
+
+    if not fichiers_a_traiter:
+        print("Aucun fichier .dat détecté dans le répertoire.")
+    else:
+        print(f"{len(fichiers_a_traiter)} fichiers à traiter.")
+
+    for file_path in fichiers_a_traiter:
+        # Éviter de traiter les fichiers solutions si on relance le script
+        if file_path.startswith("Sol_"):
+            continue
+
+        print(f"En cours : {file_path}")
+
+        try:
+            # Chargement de l'instance
+            inst = MPVRPInstance(file_path)
+
+            # Initialisation du solveur
+            solver = MPVRPSolver(inst)
+
+            # Lancement de la résolution
+            res = solver.solve()
+
+            if res:
+                # Sauvegarde au format .dat
+                out_name = "Sol_" + file_path
+                with open(out_name, "w") as f:
+                    f.write(res)
+                print(f"Fichier sauvegardé : {out_name}")
+            else:
+                print(f"Échec de résolution pour {file_path}")
+
+        except Exception as e:
+            print(f"Erreur lors du traitement de {file_path} : {e}")
+
+    print("Traitement terminé.")
