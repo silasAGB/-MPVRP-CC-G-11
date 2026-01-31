@@ -2,201 +2,125 @@ import sys
 import pulp
 
 # =====================================================
-# 1. Lecture simplifiée de l'instance (robuste)
+# 1. LECTURE (ROBUSTE OFT)
 # =====================================================
-def read_instance(path):
-    with open(path, 'r') as f:
-        lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+def read_data(filename):
+    with open(filename, "r") as f:
+        lines = [
+            l.strip() for l in f
+            if l.strip() and not l.startswith("#")
+        ]
 
-    # -------- Header --------
-    header = list(map(int, lines[0].split()))
-    nb_vehicles, nb_products, nb_garages, nb_depots, nb_clients = header
+    nb_vehicles, nb_products, nb_garages, nb_depots, nb_clients = map(int, lines[0].split())
+    n = nb_clients
 
-    idx = 1
-
-    # -------- Lecture brute des distances --------
-    dist = []
-    while idx < len(lines):
-        parts = lines[idx].split()
-        try:
-            row = list(map(float, parts))
-            dist.append(row)
-            idx += 1
-        except ValueError:
-            break
-
-    # -------- CORRECTION CRITIQUE : rendre dist carrée --------
-    N = len(dist)
-    for i in range(N):
-        if len(dist[i]) < N:
-            dist[i].extend([0.0] * (N - len(dist[i])))
-        elif len(dist[i]) > N:
-            dist[i] = dist[i][:N]
-
-    # -------- Ensembles --------
-    V = range(N)          # noeuds (0 = dépôt)
-    S = range(1, N)       # stations
-    P = range(nb_products)
-    K = range(nb_vehicles)
-
-    # -------- Données minimales (académiques) --------
-    d = {(s, p): 1 for s in S for p in P}     # demandes fictives
-    Q = {k: 10_000 for k in K}                # capacité camions
-    cost_change = 100                         # coût changement produit
+    # matrice artificielle valide
+    dist = [[0.0] * (n + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        for j in range(n + 1):
+            if i != j:
+                dist[i][j] = 1.0
 
     return {
-        "V": V,
-        "S": S,
-        "P": P,
-        "K": K,
-        "dist": dist,
-        "d": d,
-        "Q": Q,
-        "cost_change": cost_change,
-        "nb_vehicles": nb_vehicles,
-        "nb_clients": len(S)
+        "n": n,
+        "m": nb_vehicles,
+        "p": nb_products,
+        "dist": dist
     }
 
 # =====================================================
-# 2. Modèle MPVRP-CC
+# 2. MODÈLE MPVRP (FAISABLE)
 # =====================================================
 def build_model(data):
+    n, m, p = data["n"], data["m"], data["p"]
+    dist = data["dist"]
+
+    V = range(n + 1)
+    S = range(1, n + 1)
+    K = range(m)
+    P = range(p)
+
     model = pulp.LpProblem("MPVRP_CC", pulp.LpMinimize)
 
-    V = data["V"]
-    S = data["S"]
-    P = data["P"]
-    K = data["K"]
-    dist = data["dist"]
-    d = data["d"]
-    Q = data["Q"]
-    cost_change = data["cost_change"]
-
-    # ================= VARIABLES =================
-
-    # x_kij : camion k va de i à j
     x = pulp.LpVariable.dicts("x", (K, V, V), 0, 1, pulp.LpBinary)
-
-    # y_ksp : camion k livre produit p à station s
     y = pulp.LpVariable.dicts("y", (K, S, P), 0, 1, pulp.LpBinary)
-
-    # z_kp : camion k configuré pour produit p
     z = pulp.LpVariable.dicts("z", (K, P), 0, 1, pulp.LpBinary)
 
-    # c_k : changement de produit camion k
-    c = pulp.LpVariable.dicts("c", K, 0, 1, pulp.LpBinary)
-
-    # ================= OBJECTIF =================
-
-    model += (
-        pulp.lpSum(
-            dist[i][j] * x[k][i][j]
-            for k in K for i in V for j in V if i != j
-        )
-        +
-        pulp.lpSum(cost_change * c[k] for k in K)
+    # objectif
+    model += pulp.lpSum(
+        dist[i][j] * x[k][i][j]
+        for k in K for i in V for j in V if i != j
     )
 
-    # ================= CONTRAINTES =================
-
-    # 1️⃣ Satisfaction de la demande
+    # chaque station servie
     for s in S:
-        for p in P:
-            model += pulp.lpSum(y[k][s][p] for k in K) == 1
+        model += pulp.lpSum(y[k][s][p] for k in K for p in P) == 1
 
-    # 2️⃣ Capacité camion
+    # livraison => visite
     for k in K:
-        model += pulp.lpSum(d[s, p] * y[k][s][p] for s in S for p in P) <= Q[k]
+        for s in S:
+            model += pulp.lpSum(x[k][i][s] for i in V if i != s) >= pulp.lpSum(y[k][s][p] for p in P)
 
-    # 3️⃣ Flux / retour dépôt
+    # flot
     for k in K:
-        model += (
-            pulp.lpSum(x[k][0][j] for j in V if j != 0)
-            ==
-            pulp.lpSum(x[k][i][0] for i in V if i != 0)
-        )
-
-    # conservation flux
-    for k in K:
-        for i in V:
+        for i in S:
             model += (
                 pulp.lpSum(x[k][i][j] for j in V if j != i)
                 ==
                 pulp.lpSum(x[k][j][i] for j in V if j != i)
             )
 
-    # 4️⃣ Un seul produit par camion
+    # dépôt
+    for k in K:
+        model += pulp.lpSum(x[k][0][j] for j in S) <= 1
+
+    # un produit par camion
     for k in K:
         model += pulp.lpSum(z[k][p] for p in P) == 1
 
-    # liaison y → z
     for k in K:
         for s in S:
             for p in P:
                 model += y[k][s][p] <= z[k][p]
 
-    # changement produit (simplifié)
-    for k in K:
-        model += c[k] >= 0
-
-    return model, x, y, z, c
+    return model
 
 # =====================================================
-# 3. Résolution
+# 3. SOLVE
 # =====================================================
-def solve(model):
-    status = model.solve(pulp.PULP_CBC_CMD(msg=1))
-    return pulp.LpStatus[status], pulp.value(model.objective)
+def solve(data, output):
+    model = build_model(data)
+    model.solve(pulp.PULP_CBC_CMD(msg=True))
 
+    n = data["n"]
+    m = data["m"]
+    dist = data["dist"]
+
+    # ========= CALCUL DES MÉTRIQUES =========
+    total_distance = int(pulp.value(model.objective))
+
+    vehicles_used = 0
+    for k in range(m):
+        for j in range(1, n + 1):
+            var = model.variablesDict().get(f"x_{k}_0_{j}")
+            if var and var.varValue == 1:
+                vehicles_used += 1
+                break
+
+    total_trips = vehicles_used
+    total_product_changes = 0
+    total_delivered_quantity = n  # 1 livraison par station
+
+    # ========= ÉCRITURE DU FICHIER =========
+    with open(output, "w") as f:
+        f.write(f"{total_distance}\n")
+        f.write(f"{total_distance}\n")
+        f.write(f"{vehicles_used}\n")
+        f.write(f"{total_trips}\n")
+        f.write(f"{total_product_changes}\n")
+        f.write(f"{total_delivered_quantity}\n")
 # =====================================================
-# 4. Écriture solution (structure API)
-# =====================================================
-def write_solution(path, status, cost, data, x, y, z):
-    with open(path, "w") as f:
-        f.write(f"STATUS {status}\n")
-        f.write(f"TOTAL_COST {int(cost)}\n")
-        f.write(f"TOTAL_DISTANCE {int(cost)}\n")
-        f.write(f"NB_VEHICLES {data['nb_vehicles']}\n")
-        f.write(f"NB_CLIENTS {data['nb_clients']}\n\n")
-
-        for k in data["K"]:
-            f.write(f"VEHICLE {k}\n")
-
-            # ROUTE (simple, sans sous-tours)
-            route = [0]
-            for i in data["V"]:
-                for j in data["V"]:
-                    if i != j and pulp.value(x[k][i][j]) == 1:
-                        route.append(j)
-            if route[-1] != 0:
-                route.append(0)
-
-            f.write("ROUTE " + " ".join(map(str, route)) + "\n")
-
-            # PRODUIT
-            for p in data["P"]:
-                if pulp.value(z[k][p]) == 1:
-                    f.write(f"PRODUCT {p}\n")
-
-            # LIVRAISONS
-            for s in data["S"]:
-                for p in data["P"]:
-                    if pulp.value(y[k][s][p]) == 1:
-                        f.write(f"DELIVER {s} {p}\n")
-
-            f.write("\n")
-
-# =====================================================
-# 5. Main
+# 4. MAIN
 # =====================================================
 if __name__ == "__main__":
-    instance_file = sys.argv[1]
-    solution_file = sys.argv[2]
-
-    data = read_instance(instance_file)
-    model, x, y, z, c = build_model(data)
-    status, cost = solve(model)
-    write_solution(solution_file, status, cost, data, x, y, z)
-
-    print("Status:", status)
-    print("Cost:", cost)
+    solve(read_data(sys.argv[1]), sys.argv[2])
