@@ -76,7 +76,7 @@ class MPVRPSolver:
         self.solver = pywraplp.Solver.CreateSolver('SCIP')
         if not self.solver: self.solver = pywraplp.Solver.CreateSolver('CBC')
 
-        self.MAX_MINI_ROUTES = 5 # Ajusté pour la performance, à augmenter si besoin
+        self.MAX_MINI_ROUTES = 5
         self.solver.set_time_limit(120000) # 2 minutes
         self.infinity = self.solver.infinity()
 
