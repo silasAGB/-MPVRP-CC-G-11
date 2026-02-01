@@ -135,4 +135,47 @@ Cette organisation permet d’évaluer la **scalabilité** des algorithmes et d�
 
 ---
 
-Le coût total (distance + changeover)
+## Utilisation
+
+Placer une instance MPVRP-CC dans :
+
+```
+data/instances/
+```
+
+Lancer le solveur :
+
+```bash
+python main.py data/instances/MPVRP_S_001.dat
+```
+
+La solution sera générée dans :
+
+```
+data/solutions/
+```
+
+---
+
+##  Exemple de workflow
+
+1. Charger une instance
+2. Parser les données
+3. Générer une solution initiale (heuristique gloutonne)
+4. Vérifier les contraintes
+5. Calculer les coûts
+6. Exporter la solution
+7. Visualiser les routes
+
+---
+
+## ontraintes respectées
+
+* Satisfaction complète des demandes
+* Capacité maximale des véhicules
+* Un seul produit par mini-route
+* Retour obligatoire au garage
+* Alignement parfait entre trajet et produits
+
+---
+
