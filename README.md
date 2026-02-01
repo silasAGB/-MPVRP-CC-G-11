@@ -169,13 +169,14 @@ data/solutions/
 
 ---
 
-## ontraintes respectées
+## Contraintes respectées
 
 * Satisfaction complète des demandes
 * Capacité maximale des véhicules
 * Un seul produit par mini-route
 * Retour obligatoire au garage
 * Alignement parfait entre trajet et produits
+* Detection de changement
 
 ---
 
